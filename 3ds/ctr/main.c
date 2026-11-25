@@ -1162,9 +1162,14 @@ static bool run_game(const char* file) {
             busyTicks = 0;
             fpsFrames = 0;
             fpsStart = now;
-            u8 battery = 0, charging = 0;
-            if (R_SUCCEEDED(MCUHWC_GetBatteryLevel(&battery))) hostPtr->batteryPct = battery;
-            if (R_SUCCEEDED(PTMU_GetBatteryChargeState(&charging))) hostPtr->charging = charging != 0;
+            // The two battery calls are IPC and cost 10-33 ms on an Old 3DS: every 30 s is enough.
+            static u64 batteryAt;
+            if (!batteryAt || now - batteryAt >= 30000) {
+                batteryAt = now;
+                u8 battery = 0, charging = 0;
+                if (R_SUCCEEDED(MCUHWC_GetBatteryLevel(&battery))) hostPtr->batteryPct = battery;
+                if (R_SUCCEEDED(PTMU_GetBatteryChargeState(&charging))) hostPtr->charging = charging != 0;
+            }
             if (uiPtr->tab == PD_TAB_SETTINGS) session.redraw = true;
         }
 
