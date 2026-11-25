@@ -66,7 +66,7 @@ static struct {
     uint8_t trailer[GBA_RTC_TRAILER];
     bool hadTrailer;
     size_t loadedSize;
-    uint32_t savedHash, pendingHash;
+    uint32_t savedWrites, pendingWrites; // gpSP's backup_writes at the last file write / change seen
     bool savePending;
     int saveQuiet;
     int frames;
@@ -250,12 +250,6 @@ static uint32_t crc32_of(const uint8_t* p, size_t n) {
     return ~c;
 }
 
-static uint32_t hash_of(const uint8_t* p, size_t n) {
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
-    return h;
-}
-
 static uint8_t* read_file(const char* path, size_t* size) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
@@ -327,7 +321,7 @@ static void read_save(void) {
         emu_log("save: read %u bytes from %s", (unsigned) n, G.savePath);
     }
     free(file);
-    G.savedHash = hash_of(gamepak_backup, sizeof(gamepak_backup));
+    G.savedWrites = backup_writes;
     G.savePending = false;
     G.saveQuiet = 0;
 }
@@ -342,7 +336,7 @@ static bool write_save(void) {
     bool ok = write_file(G.savePath, gamepak_backup, size, G.trailer, G.hadTrailer ? GBA_RTC_TRAILER : 0);
     emu_log(ok ? "save: wrote %s" : "save: COULDN'T WRITE %s", G.savePath);
     if (ok) {
-        G.savedHash = hash_of(gamepak_backup, sizeof(gamepak_backup));
+        G.savedWrites = backup_writes;
         G.loadedSize = size;
         G.savePending = false;
         G.saveQuiet = 0;
@@ -350,18 +344,18 @@ static bool write_save(void) {
     return ok;
 }
 
-// Every fourth frame (a 128 KB hash): the game's writes to its save memory, and the file once they've stopped for
+// Every fourth frame: the game's writes to its save memory (gpSP counts them), and the file once they've stopped for
 // SAVE_QUIET_FRAMES.
 static void track_save(void) {
     if (++G.frames % 4) return;
-    uint32_t h = hash_of(gamepak_backup, sizeof(gamepak_backup));
-    if (h == G.savedHash) {
+    uint32_t h = backup_writes;
+    if (h == G.savedWrites) {
         G.savePending = false;
         return;
     }
-    if (!G.savePending || h != G.pendingHash) {
+    if (!G.savePending || h != G.pendingWrites) {
         G.savePending = true;
-        G.pendingHash = h;
+        G.pendingWrites = h;
         G.saveQuiet = 0;
         return;
     }
@@ -370,11 +364,11 @@ static void track_save(void) {
 }
 
 int pd_gpsp_save_dirty(void) {
-    return G.loaded && (G.savePending || hash_of(gamepak_backup, sizeof(gamepak_backup)) != G.savedHash);
+    return G.loaded && (G.savePending || backup_writes != G.savedWrites);
 }
 
 void pd_gpsp_flush_save(void) {
-    if (G.loaded && hash_of(gamepak_backup, sizeof(gamepak_backup)) != G.savedHash) write_save();
+    if (G.loaded && backup_writes != G.savedWrites) write_save();
 }
 
 // --- the machine ---

@@ -244,10 +244,88 @@ index 605f84f..1fe8617 100644
        /* POP rlist */                                                         \
        thumb_block_memory(load, no, up, 13);                                   \
 diff --git a/gba_memory.c b/gba_memory.c
-index e75e9a8..e3678c4 100644
+index e75e9a8..4b23c61 100644
 --- a/gba_memory.c
 +++ b/gba_memory.c
-@@ -2672,11 +2672,31 @@ u8 *load_gamepak_page(u32 physical_index)
+@@ -359,6 +359,16 @@ u8 bios_rom[1024 * 16];
+ 
+ // Up to 128kb, store SRAM, flash ROM, or EEPROM here.
+ u8 gamepak_backup[1024 * 128];
++u32 backup_writes;
++
++static inline void backup_store(u32 index, u8 value)
++{
++  if (gamepak_backup[index] != value)
++  {
++    gamepak_backup[index] = value;
++    backup_writes++;
++  }
++}
+ 
+ u32 dma_bus_val;
+ dma_transfer_type dma[4];
+@@ -631,13 +641,15 @@ void function_cc write_eeprom(u32 unused_address, u32 value)
+         {
+           eeprom_mode = EEPROM_WRITE_MODE;
+           memset(gamepak_backup + eeprom_address, 0, 8);
++          backup_writes++;
+         }
+       }
+       break;
+ 
+     case EEPROM_WRITE_MODE:
+-      gamepak_backup[eeprom_address + (eeprom_counter / 8)] |=
+-       (value & 0x01) << (7 - (eeprom_counter % 8));
++      backup_store(eeprom_address + (eeprom_counter / 8),
++       gamepak_backup[eeprom_address + (eeprom_counter / 8)] |
++       ((value & 0x01) << (7 - (eeprom_counter % 8))));
+       eeprom_counter++;
+       if(eeprom_counter == 64)
+       {
+@@ -1428,6 +1440,7 @@ void function_cc write_backup(u32 address, u32 value)
+           if(flash_mode == FLASH_ERASE_MODE)
+           {
+             memset(gamepak_backup, 0xFF, 1024 * 128);
++            backup_writes++;
+             flash_mode = FLASH_BASE_MODE;
+           }
+           break;
+@@ -1438,7 +1451,7 @@ void function_cc write_backup(u32 address, u32 value)
+       flash_command_position = 0;
+     }
+     if(backup_type == BACKUP_SRAM)
+-      gamepak_backup[0x5555] = value;
++      backup_store(0x5555, value);
+   }
+   else
+ 
+@@ -1453,6 +1466,7 @@ void function_cc write_backup(u32 address, u32 value)
+       // Erase sector
+       u32 fulladdr = (address & 0xF000) + 64*1024*flash_bank_num;
+       memset(&gamepak_backup[fulladdr], 0xFF, 1024 * 4);
++      backup_writes++;
+       flash_mode = FLASH_BASE_MODE;
+       flash_command_position = 0;
+     }
+@@ -1471,7 +1485,7 @@ void function_cc write_backup(u32 address, u32 value)
+     {
+       // Write value to flash ROM
+       u32 fulladdr = address + 64*1024*flash_bank_num;
+-      gamepak_backup[fulladdr] = value;
++      backup_store(fulladdr, value);
+       flash_mode = FLASH_BASE_MODE;
+     }
+     else
+@@ -1479,7 +1493,7 @@ void function_cc write_backup(u32 address, u32 value)
+     if(backup_type == BACKUP_SRAM)
+     {
+       // Write value to SRAM
+-      gamepak_backup[address] = value;
++      backup_store(address, value);
+     }
+   }
+ }
+@@ -2672,11 +2686,31 @@ u8 *load_gamepak_page(u32 physical_index)
    return swap_location;
  }
  
@@ -280,7 +358,7 @@ index e75e9a8..e3678c4 100644
    while (gamepak_buffer_count < ROM_BUFFER_SIZE)
    {
      void *ptr = malloc(gamepak_buffer_blocksize);
-@@ -2779,10 +2799,13 @@ void memory_term(void)
+@@ -2779,10 +2813,13 @@ void memory_term(void)
      gamepak_file_large = NULL;
    }
  
@@ -294,6 +372,30 @@ index e75e9a8..e3678c4 100644
  
    if (gamepak_mini_rom)
    {
+@@ -3234,7 +3271,10 @@ static void normalize_blank_backup_for_detected_type(void)
+   // Some frontends create blank save files filled with 0x00.
+   // Real flash/EEPROM idle state is 0xFF; normalize it for first boot.
+   if (all_zero)
++  {
+     memset(gamepak_backup, 0xFF, size);
++    backup_writes++;
++  }
+ }
+ 
+ static void detect_backup_subcircuit(const u8 *rom, u32 rom_size)
+diff --git a/gba_memory.h b/gba_memory.h
+index 2fdd70d..80b17ca 100644
+--- a/gba_memory.h
++++ b/gba_memory.h
+@@ -389,6 +389,8 @@ extern u32 flash_bank_cnt;
+ extern u32 eeprom_size;
+ 
+ extern u8 gamepak_backup[1024 * 128];
++// Counts every change to gamepak_backup, so the host can tell a save changed without hashing it.
++extern u32 backup_writes;
+ 
+ // Page sticky bit routines
+ extern u32 gamepak_sticky_bit[1024/32];
 diff --git a/libretro/libretro.c b/libretro/libretro.c
 index 30f3acb..8cfe0ba 100644
 --- a/libretro/libretro.c

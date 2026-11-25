@@ -4,6 +4,7 @@
 #   - execute_arm_until: its interpreter run to a PC, the hardware not (the port's calls into the game);
 #   - gpsp_bkpt: a Thumb BKPT handed to the host, from the interpreter and the ARM recompiler's stub (the native mixer);
 #   - gpsp_hblank_hook: the host's say over an H-blank interrupt in update_gba (a stock handler with nothing to call);
+#   - backup_writes: a count of changes to the save memory, so the host needn't hash it to find a write;
 #   - the 3DS recompiler's caches from the heap, made executable in place (MEMOP_PROT), not mapped at a fixed address our
 #     static data covers; refused = the interpreter.
 # Applied to the submodule's working tree at configure time, once: a tree that already has it is left alone (looked for by
@@ -23,8 +24,9 @@ string(FIND "${PK_GPSP_CPU}" "execute_arm_until" PK_GPSP_PATCHED_CALL)
 string(FIND "${PK_GPSP_CPU}" "gpsp_bkpt_hook" PK_GPSP_PATCHED_BKPT)
 string(FIND "${PK_GPSP_MAIN}" "gpsp_hblank_hook" PK_GPSP_PATCHED_HBLANK)
 string(FIND "${PK_GPSP_CPUH}" "made executable in place" PK_GPSP_PATCHED_JITMEM)
+string(FIND "${PK_GPSP_MEMORY}" "backup_writes" PK_GPSP_PATCHED_BACKUP)
 if(NOT PK_GPSP_PATCHED EQUAL -1 AND (PK_GPSP_PATCHED_SEM EQUAL -1 OR PK_GPSP_PATCHED_CALL EQUAL -1 OR PK_GPSP_PATCHED_BKPT EQUAL -1
-        OR PK_GPSP_PATCHED_HBLANK EQUAL -1 OR PK_GPSP_PATCHED_JITMEM EQUAL -1))
+        OR PK_GPSP_PATCHED_HBLANK EQUAL -1 OR PK_GPSP_PATCHED_JITMEM EQUAL -1 OR PK_GPSP_PATCHED_BACKUP EQUAL -1))
     # A tree with the first patch only: gba_memory.c back to gpSP's (patch -R of that part isn't kept apart), then all of it.
     message(FATAL_ERROR "gpSP holds part of gpsp-pokedaisy.patch: git -C third_party/gpsp checkout . and configure again")
 endif()
