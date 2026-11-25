@@ -412,8 +412,13 @@ static void focus_ring(struct pd_ui* ui, struct pd_canvas* c) {
 
 const struct pd_game* ui_game;
 
+// Built while the game loads, not by the paint after the first battle: the party slots' art, the type tags and the
+// party backdrop's picture at this canvas's size.
 void pd_ui_warm(struct pd_ui* ui, struct pd_canvas* c, const struct pd_game* g) {
     if (ui_gen5_style(ui, g)) ui_gen5_warm(c);
+    pd_party_art_for(g);
+    pd_type_tags(g);
+    if (!ui->keepBackdrop) pd_party_backdrop(ui->backdropFrame ? ui->backdropFrame : c, g);
 }
 
 void pd_ui_draw(struct pd_ui* ui, struct pd_canvas* c, const struct pd_game* g,
