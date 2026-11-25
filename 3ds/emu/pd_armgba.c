@@ -3,6 +3,7 @@
 // through its own libretro layer, as armGBA-3DS drives it, with no Game Boy side (gb_none.c stands in for Gambatte).
 // Based on ratherDashing's glue for the pokedaisy-3ds fork. armGBA itself is MPL-2.0, linked, not copied.
 #include "pd_armgba_internal.h"
+#include "../host/pd_writer.h"
 
 #include <stdarg.h>
 #include <errno.h>
@@ -42,6 +43,8 @@ static struct {
     bool skipVideo;
     bool savePending;
     int saveQuiet;
+    volatile int writeFailed; // the background write of the save failed (pd_writer.h)
+    int retryWait;            // frames before a failed save is written again
     bool hadTrailer;
     const struct retro_core_option_v2_definition* options;
     retro_audio_buffer_status_callback_t audioStatus;
@@ -326,6 +329,10 @@ static void put64(uint8_t* to, uint64_t v) {
 }
 
 static uint8_t* read_file(const char* path, size_t* size) {
+    // A file still queued for writing is read from the queue's bytes, or after the writer is done with it.
+    uint8_t* queuedBytes = pd_writer_pending_copy(path, size);
+    if (queuedBytes) return queuedBytes;
+    if (pd_writer_has(path)) pd_writer_drain();
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -341,46 +348,16 @@ static uint8_t* read_file(const char* path, size_t* size) {
     return data;
 }
 
-// The whole file to a new one first, then over the old: a crash or a full card can't leave half a save.
-// The file's bytes copied into one heap buffer and written at once: handed the save memory itself, the 3DS's file
-// system took 4.1 s for a 128 KB save (the game stood still); from the heap the same write takes ~45 ms. (setvbuf
-// isn't enough: newlib's fwrite skips the buffer for data at least its size, a save without a clock trailer.)
-static bool write_from_heap(FILE* f, const uint8_t* a, size_t aLen, const uint8_t* b, size_t bLen) {
-    uint8_t* copy = malloc(aLen + bLen);
-    if (!copy) return fwrite(a, 1, aLen, f) == aLen && (!bLen || fwrite(b, 1, bLen, f) == bLen);
-    memcpy(copy, a, aLen);
-    if (bLen) memcpy(copy + aLen, b, bLen);
-    bool ok = fwrite(copy, 1, aLen + bLen, f) == aLen + bLen;
-    free(copy);
-    return ok;
-}
-
-static bool write_file(const char* path, const uint8_t* a, size_t aLen, const uint8_t* b, size_t bLen) {
-    char temp[1100];
-    snprintf(temp, sizeof(temp), "%s.tmp", path);
-    FILE* f = fopen(temp, "wb");
-    if (!f) return false;
-    bool ok = write_from_heap(f, a, aLen, b, bLen);
-    ok = fclose(f) == 0 && ok;
-    if (!ok) {
-        remove(temp);
-        return false;
-    }
-#if defined(__3DS__)
-    remove(path); // the SD card's rename won't replace a file
-#endif
-    return rename(temp, path) == 0;
-}
-
 static void read_save(void) {
     size_t size = 0;
     uint8_t* file = read_file(E.savePath, &size);
-    if (!file) {
-        // A write cut off between the old file going and the new one's rename.
-        char temp[1100];
-        snprintf(temp, sizeof(temp), "%s.tmp", E.savePath);
-        file = read_file(temp, &size);
-        if (file) emu_log("save: %s is missing, read its .tmp", E.savePath);
+    // A write cut off between the old file set aside and the new one's rename.
+    for (int i = 0; !file && i < 2; i++) {
+        static const char* const suffixes[] = { ".bak", ".tmp" };
+        char other[1100];
+        snprintf(other, sizeof(other), "%s%s", E.savePath, suffixes[i]);
+        file = read_file(other, &size);
+        if (file) emu_log("save: %s is missing, read its %s", E.savePath, suffixes[i]);
     }
     E.hadTrailer = false;
     if (file) {
@@ -406,6 +383,7 @@ static void read_save(void) {
 static bool write_save(void) {
     size_t size = savedataSize(gba);
     if (!size) return true; // the game never touched its save memory: nothing to keep
+    if (E.retryWait) return false;
     uint8_t trailer[GBA_RTC_TRAILER] = { 0 };
     bool clock = (gba->gpio.devices & HW_RTC) != 0;
     if (clock) {
@@ -413,10 +391,15 @@ static bool write_save(void) {
         trailer[7] = gba->gpio.rtc.control;
         put64(trailer + 8, (uint64_t) time(NULL));
     }
-    uint64_t t0 = load_ms();
-    bool ok = write_file(E.savePath, gba->savedata.storage, size, trailer, clock ? sizeof(trailer) : 0);
-    unsigned took = (unsigned) (load_ms() - t0);
-    emu_log(ok ? "save: wrote %s (%u bytes, %u ms)" : "save: COULDN'T WRITE %s (%u bytes, %u ms)", E.savePath, (unsigned) size, took);
+    size_t extra = clock ? sizeof(trailer) : 0;
+    uint8_t* copy = malloc(size + extra);
+    bool ok = copy != NULL;
+    if (ok) {
+        memcpy(copy, gba->savedata.storage, size);
+        memcpy(copy + size, trailer, extra);
+        pd_writer_write_ex(E.savePath, copy, size + extra, &E.writeFailed, NULL, true);
+    }
+    emu_log(ok ? "save: handed %s (%u bytes) to the writer" : "save: COULDN'T WRITE %s (%u bytes)", E.savePath, (unsigned) size);
     if (ok) {
         E.savePending = false;
         E.saveQuiet = 0;
@@ -424,8 +407,19 @@ static bool write_save(void) {
     return ok;
 }
 
+static void note_failed_write(void) {
+    if (!E.writeFailed) return;
+    E.writeFailed = 0;
+    E.savePending = true; // the file isn't what the game has: written again, no sooner than 2 s on
+    E.saveQuiet = 0;
+    E.retryWait = 120;
+    emu_log("save: the write failed, trying again in 2 s");
+}
+
 // After each frame: the game's writes to its save memory, and the file once they've stopped.
 static void track_save(void) {
+    note_failed_write();
+    if (E.retryWait) E.retryWait--;
     if (gba->savedata.dirty) {
         gba->savedata.dirty = false;
         E.savePending = true;
@@ -434,17 +428,23 @@ static void track_save(void) {
     if (E.savePending && ++E.saveQuiet >= SAVE_QUIET_FRAMES) write_save();
 }
 
+// Written and on the card when it returns, a failed write tried once more.
 void pd_armgba_flush_save(void) {
     if (!E.loaded) return;
+    E.retryWait = 0;
     if (gba->savedata.dirty) {
         gba->savedata.dirty = false;
         E.savePending = true;
     }
     if (E.savePending) write_save();
+    pd_writer_drain();
+    note_failed_write();
+    E.retryWait = 0;
+    if (E.savePending && write_save()) pd_writer_drain();
 }
 
 int pd_armgba_save_dirty(void) {
-    return E.loaded && (E.savePending || gba->savedata.dirty);
+    return E.loaded && (E.savePending || E.writeFailed || gba->savedata.dirty);
 }
 
 // --- the machine ---
@@ -734,16 +734,16 @@ struct state_header {
 bool pd_armgba_save_state(const char* path) {
     if (!E.loaded) return false;
     size_t size = retro_serialize_size();
-    uint8_t* data = size ? malloc(size) : NULL;
-    if (!data || !retro_serialize(data, size)) {
+    uint8_t* data = size ? malloc(sizeof(struct state_header) + size) : NULL;
+    if (!data || !retro_serialize(data + sizeof(struct state_header), size)) {
         free(data);
         return false;
     }
     struct state_header h = { .version = STATE_VERSION, .platform = 0, .romCrc = E.romCrc, .size = (uint32_t) size };
     memcpy(h.magic, STATE_MAGIC_TEXT, 4);
-    bool ok = write_file(path, (const uint8_t*) &h, sizeof(h), data, size);
-    free(data);
-    return ok;
+    memcpy(data, &h, sizeof(h));
+    pd_writer_write(path, data, sizeof(h) + size, NULL);
+    return true;
 }
 
 enum pd_armgba_state pd_armgba_load_state(const char* path) {

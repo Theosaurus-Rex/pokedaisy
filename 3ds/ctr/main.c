@@ -39,6 +39,7 @@
 #include "../core/pd_tr.h"
 #include "../host/pd_session.h"
 #include "../host/pd_mixer.h"
+#include "../host/pd_writer.h"
 #include "../emu/pd_armgba.h"
 #include "../emu/pd_gpsp.h"
 #include "host.h"
@@ -323,9 +324,21 @@ static bool copy_file(const char* from, const char* to) {
         fclose(in);
         return false;
     }
+    bool ok = true;
+    // The whole file in one read and one write when it fits in memory: each call to the SD card is slow.
+    fseek(in, 0, SEEK_END);
+    long length = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    uint8_t* whole = length > 0 ? malloc((size_t) length) : NULL;
+    if (whole) {
+        ok = fread(whole, 1, (size_t) length, in) == (size_t) length && fwrite(whole, 1, (size_t) length, out) == (size_t) length;
+        free(whole);
+        fclose(in);
+        if (fclose(out) != 0) ok = false;
+        return ok;
+    }
     static char buf[16 * 1024];
     size_t n;
-    bool ok = true;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (fwrite(buf, 1, n, out) != n) {
             ok = false;
@@ -524,9 +537,14 @@ static void state_path(void* ctx, int slot, char* vf, size_t vfLen, char* path, 
     snprintf(path, pathLen, "sdmc:%s", vf);
 }
 
+static void backup_job(const char* base, const char* savePath) {
+    backup_save(base, savePath);
+}
+
+// On the writer's thread, after the saves queued before it: the copy and the pruning are slow SD calls.
 static void backup_for_load(void* ctx) {
     const struct game_files* f = ctx;
-    backup_save(f->base, f->saveSd);
+    pd_writer_call(backup_job, f->base, f->saveSd);
 }
 
 static void settings_changed(void* ctx) {
@@ -946,6 +964,7 @@ static bool run_game(const char* file) {
 
     while ((appRunning = aptMainLoop())) {
         u64 loopBegin = svcGetSystemTick();
+        pd_writer_poll();
         int catchUp = 0;
         enum pd_draw_plan drawPlan = PD_DRAW_NOW;
         if (paced) {
@@ -1082,6 +1101,7 @@ static bool run_game(const char* file) {
                 break;
             case PD_ACTION_RESTART_GAME:
                 pk_finish_save(core, PK_FINISH_SAVE_FRAMES, NULL);
+                pd_writer_drain();
                 core->reset(core);
                 pk_heal_rtc(core);
                 break;
@@ -1335,6 +1355,7 @@ static bool run_game(const char* file) {
     write_card(file, &session.game, &session.snap);
     // armGBA writes the save if the game changed it, and its warm list; mGBA's VFile flushes on unmap.
     core->deinit(core);
+    pd_writer_drain(); // the saves and states handed over so far are on the card before another game opens
     host_lent_code_release();
     core1_back();
     host_log("game: closed");
@@ -1609,6 +1630,7 @@ static bool pick_rom(char* out, size_t outLen) {
             break;
         }
         pd_library_tick(&library);
+        pd_writer_poll();
         {
             // The battery in every page's title, read once a second.
             static u64 batteryAt;
@@ -1668,6 +1690,10 @@ static void read_system_language(void) {
                      lang == CFG_LANGUAGE_PT ? (region == CFG_REGION_USA ? PD_LANG_BR : PD_LANG_PT) : PD_LANG_EN);
 }
 
+static void writer_log(const char* line) {
+    host_log("%s", line);
+}
+
 int main(void) {
     // First, while the heap is whole: the 32 MB every game is read into.
     bool arena = host_rom_arena_init();
@@ -1721,6 +1747,7 @@ int main(void) {
         settings.expandOff = true;
         pd_settings_save(&settings, SETTINGS_FILE);
     }
+    pd_writer_set_log(writer_log);
     audio_init();
     mcuHwcInit();
     ptmuInit(); // the battery's charge state (a bolt by the battery)
@@ -1733,6 +1760,7 @@ int main(void) {
 #ifdef PD_DEV
     bool restart = devlink_restart_wanted();
 #endif
+    pd_writer_exit();
     devlink_stop();
 #ifdef PD_DEV
     if (restart) devlink_chainload();

@@ -4,6 +4,7 @@
 #include "../core/pd_tables.h"
 #include "../../linux/gb_field.h"
 #include "pd_mixer.h"
+#include "pd_writer.h"
 #include "../emu/pd_armgba.h"
 #include "../emu/pd_gpsp.h"
 
@@ -200,10 +201,14 @@ static void read_slot(struct pd_session* s, int slot) {
     struct stat st;
     out->used = !stat(path, &st);
     out->thumb = NULL;
+    thumb_path(path, thumb, sizeof(thumb));
+    if (pd_writer_has(path) || pd_writer_has(thumb)) {
+        pd_writer_drain();
+        out->used = !stat(path, &st);
+    }
     if (!out->used) return;
     struct tm* t = localtime(&st.st_mtime);
     if (t) strftime(out->when, sizeof(out->when), "%m-%d %H:%M", t);
-    thumb_path(path, thumb, sizeof(thumb));
     FILE* f = fopen(thumb, "rb");
     if (!f) return;
     size_t want = sizeof(s->thumbs[slot]);
@@ -219,29 +224,19 @@ static void undo_path(const struct pd_session* s, const char* name, char* vf, si
     snprintf(path, pathLen, "%s.%s", p, name);
 }
 
-static void copy_file(const char* from, const char* to) {
-    FILE* in = fopen(from, "rb");
-    if (!in) return;
-    FILE* out = fopen(to, "wb");
-    if (out) {
-        static uint8_t chunk[8192];
-        size_t n;
-        while ((n = fread(chunk, 1, sizeof(chunk), in)) > 0) fwrite(chunk, 1, n, out);
-        fclose(out);
-    }
-    fclose(in);
-}
+static bool write_mgba_state(struct pd_session* s, const char* path);
 
 bool pd_session_save_state(struct pd_session* s, int slot) {
+    bool wantUndo = false;
     {
         char vf0[512], path0[512], undoVf[512], undo[512];
         state_paths(s, slot, vf0, sizeof(vf0), path0, sizeof(path0));
         undo_path(s, "undosave", undoVf, sizeof(undoVf), undo, sizeof(undo));
         struct stat st;
+        // The slot's file goes aside as the undo by the writer's own job, in the same step as the new one comes in.
         if (!stat(path0, &st)) {
-            copy_file(path0, undo);
-            s->undoSaveSlot = slot;
-            s->host.undoSave = true;
+            pd_writer_aside_next(path0, undo);
+            wantUndo = true;
         }
     }
     char vfPath[512], path[512], thumb[520];
@@ -253,10 +248,12 @@ bool pd_session_save_state(struct pd_session* s, int slot) {
     } else if (pd_gpsp_is(s->core)) {
         ok = pd_gpsp_save_state(path);
     } else {
-        struct VFile* vf = VFileOpen(vfPath, O_CREAT | O_TRUNC | O_RDWR);
-        if (!vf) return false;
-        ok = mCoreSaveStateNamed(s->core, vf, STATE_FLAGS);
-        vf->close(vf);
+        ok = write_mgba_state(s, path);
+    }
+    pd_writer_aside_next(NULL, NULL);
+    if (ok && wantUndo) {
+        s->undoSaveSlot = slot;
+        s->host.undoSave = true;
     }
     uint32_t* px = s->thumbs[slot];
     unsigned gw = 240, gh = 160;
@@ -267,15 +264,45 @@ bool pd_session_save_state(struct pd_session* s, int slot) {
             px[y * PD_STATE_THUMB_W + x] = (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF);
         }
     }
-    thumb_path(path, thumb, sizeof(thumb));
-    FILE* f = fopen(thumb, "wb");
-    if (f) {
-        fwrite(px, 1, sizeof(s->thumbs[slot]), f);
-        fclose(f);
+    if (ok) {
+        // The files are on their way: the slot shows as saved now, its picture from memory.
+        thumb_path(path, thumb, sizeof(thumb));
+        uint8_t* copy = malloc(sizeof(s->thumbs[slot]));
+        if (copy) {
+            memcpy(copy, px, sizeof(s->thumbs[slot]));
+            pd_writer_write(thumb, copy, sizeof(s->thumbs[slot]), NULL);
+        }
+        struct pd_state_slot* out = &s->host.slots[slot];
+        time_t nowT = time(NULL);
+        struct tm* t = localtime(&nowT);
+        out->used = true;
+        if (t) strftime(out->when, sizeof(out->when), "%m-%d %H:%M", t);
+        out->thumb = copy ? px : NULL;
+    } else {
+        read_slot(s, slot);
     }
-    read_slot(s, slot);
     s->redraw = true;
     return ok;
+}
+
+// mGBA's state is made in memory and handed to the writer like the others.
+static bool write_mgba_state(struct pd_session* s, const char* path) {
+    struct VFile* vf = VFileMemChunk(NULL, 0);
+    if (!vf) return false;
+    bool ok = mCoreSaveStateNamed(s->core, vf, STATE_FLAGS);
+    ssize_t size = ok ? vf->size(vf) : 0;
+    uint8_t* buf = size > 0 ? malloc((size_t) size) : NULL;
+    if (buf) {
+        vf->seek(vf, 0, SEEK_SET);
+        if (vf->read(vf, buf, (size_t) size) != size) {
+            free(buf);
+            buf = NULL;
+        }
+    }
+    vf->close(vf);
+    if (!buf) return false;
+    pd_writer_write(path, buf, (size_t) size, NULL);
+    return true;
 }
 
 static void write_state(struct pd_session* s, const char* vfPath, const char* path) {
@@ -288,11 +315,9 @@ static void write_state(struct pd_session* s, const char* vfPath, const char* pa
         pd_gpsp_save_state(path);
         return;
     }
-    struct VFile* vf = VFileOpen(vfPath, O_CREAT | O_TRUNC | O_RDWR);
-    if (!vf) return;
+    (void) vfPath;
     pd_mixer_release(s->core);
-    mCoreSaveStateNamed(s->core, vf, STATE_FLAGS);
-    vf->close(vf);
+    write_mgba_state(s, path);
 }
 
 bool pd_session_undo_save(struct pd_session* s) {
@@ -300,7 +325,7 @@ bool pd_session_undo_save(struct pd_session* s) {
     char vf[512], path[512], undo[512], undoVf[512];
     state_paths(s, s->undoSaveSlot, vf, sizeof(vf), path, sizeof(path));
     undo_path(s, "undosave", undoVf, sizeof(undoVf), undo, sizeof(undo));
-    copy_file(undo, path);
+    pd_writer_rename(undo, path);
     read_slot(s, s->undoSaveSlot);
     s->undoSaveSlot = -1;
     // The HUD: the 3DS's compact one, no buttons (the top screen has no touch; X opens the companion).
@@ -327,6 +352,7 @@ static bool load_state_file(struct pd_session* s, const char* vfPath, const char
         else if (r == PD_GPSP_STATE_BAD) pd_session_show(s, "THAT STATE DIDN'T LOAD");
         return r == PD_GPSP_STATE_OK;
     }
+    if (pd_writer_has(path)) pd_writer_drain();
     struct VFile* vf = VFileOpen(vfPath, O_RDONLY);
     if (!vf) return false;
     bool ok = mCoreLoadStateNamed(s->core, vf, STATE_FLAGS);

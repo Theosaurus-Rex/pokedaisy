@@ -3,6 +3,7 @@
 // mGBA's layout and states of its own. Built into one object with gpSP (emu/gpsp.cmake): this is the only file that
 // sees gpSP's headers, and pd_gpsp.h's names are the object's only globals.
 #include "pd_gpsp.h"
+#include "../host/pd_writer.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -69,6 +70,8 @@ static struct {
     uint32_t savedWrites, pendingWrites; // gpSP's backup_writes at the last file write / change seen
     bool savePending;
     int saveQuiet;
+    volatile int writeFailed; // the background write of the save failed (pd_writer.h)
+    int retryWait;            // frames before a failed save is written again
     int frames;
     bool threaded;
     int threadStartError; // this open's attempt, not the previous game's worker
@@ -251,6 +254,10 @@ static uint32_t crc32_of(const uint8_t* p, size_t n) {
 }
 
 static uint8_t* read_file(const char* path, size_t* size) {
+    // A file still queued for writing is read from the queue's bytes, or after the writer is done with it.
+    uint8_t* queuedBytes = pd_writer_pending_copy(path, size);
+    if (queuedBytes) return queuedBytes;
+    if (pd_writer_has(path)) pd_writer_drain();
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -266,46 +273,18 @@ static uint8_t* read_file(const char* path, size_t* size) {
     return data;
 }
 
-// The whole file to a new one first, then over the old: a crash or a full card can't leave half a save.
-// One heap copy written at once: pd_armgba.c's write_from_heap says why.
-static bool write_from_heap(FILE* f, const uint8_t* a, size_t aLen, const uint8_t* b, size_t bLen) {
-    uint8_t* copy = malloc(aLen + bLen);
-    if (!copy) return fwrite(a, 1, aLen, f) == aLen && (!bLen || fwrite(b, 1, bLen, f) == bLen);
-    memcpy(copy, a, aLen);
-    if (bLen) memcpy(copy + aLen, b, bLen);
-    bool ok = fwrite(copy, 1, aLen + bLen, f) == aLen + bLen;
-    free(copy);
-    return ok;
-}
-
-static bool write_file(const char* path, const uint8_t* a, size_t aLen, const uint8_t* b, size_t bLen) {
-    char temp[1100];
-    snprintf(temp, sizeof(temp), "%s.tmp", path);
-    FILE* f = fopen(temp, "wb");
-    if (!f) return false;
-    bool ok = write_from_heap(f, a, aLen, b, bLen);
-    ok = fclose(f) == 0 && ok;
-    if (!ok) {
-        remove(temp);
-        return false;
-    }
-#if defined(_3DS)
-    remove(path); // the SD card's rename won't replace a file
-#endif
-    return rename(temp, path) == 0;
-}
-
 static void read_save(void) {
     G.hadTrailer = false;
     G.loadedSize = 0;
     size_t size = 0;
     uint8_t* file = read_file(G.savePath, &size);
-    if (!file) {
-        // A write cut off between the old file going and the new one's rename.
-        char temp[1100];
-        snprintf(temp, sizeof(temp), "%s.tmp", G.savePath);
-        file = read_file(temp, &size);
-        if (file) emu_log("save: %s is missing, read its .tmp", G.savePath);
+    // A write cut off between the old file set aside and the new one's rename.
+    for (int i = 0; !file && i < 2; i++) {
+        static const char* const suffixes[] = { ".bak", ".tmp" };
+        char other[1100];
+        snprintf(other, sizeof(other), "%s%s", G.savePath, suffixes[i]);
+        file = read_file(other, &size);
+        if (file) emu_log("save: %s is missing, read its %s", G.savePath, suffixes[i]);
     }
     if (file) {
         // mGBA's layout: the save memory (512 B ... 128 KB, a multiple of 512), then maybe its 16-byte clock.
@@ -333,8 +312,16 @@ static bool write_save(void) {
     if (size < G.loadedSize) size = G.loadedSize;
     if (size > sizeof(gamepak_backup)) size = sizeof(gamepak_backup);
     if (!size) return true; // the game never touched its save memory: nothing to keep
-    bool ok = write_file(G.savePath, gamepak_backup, size, G.trailer, G.hadTrailer ? GBA_RTC_TRAILER : 0);
-    emu_log(ok ? "save: wrote %s" : "save: COULDN'T WRITE %s", G.savePath);
+    if (G.retryWait) return false;
+    size_t trailer = G.hadTrailer ? GBA_RTC_TRAILER : 0;
+    uint8_t* copy = malloc(size + trailer);
+    bool ok = copy != NULL;
+    if (ok) {
+        memcpy(copy, gamepak_backup, size);
+        memcpy(copy + size, G.trailer, trailer);
+        pd_writer_write_ex(G.savePath, copy, size + trailer, &G.writeFailed, NULL, true);
+    }
+    emu_log(ok ? "save: handed %s to the writer" : "save: COULDN'T WRITE %s", G.savePath);
     if (ok) {
         G.savedWrites = backup_writes;
         G.loadedSize = size;
@@ -344,9 +331,19 @@ static bool write_save(void) {
     return ok;
 }
 
+static void note_failed_write(void) {
+    if (!G.writeFailed) return;
+    G.writeFailed = 0;
+    G.savedWrites = backup_writes - 1; // the file isn't what the game has: written again, no sooner than 2 s on
+    G.retryWait = 120;
+    emu_log("save: the write failed, trying again in 2 s");
+}
+
 // Every fourth frame: the game's writes to its save memory (gpSP counts them), and the file once they've stopped for
 // SAVE_QUIET_FRAMES.
 static void track_save(void) {
+    note_failed_write();
+    if (G.retryWait) G.retryWait--;
     if (++G.frames % 4) return;
     uint32_t h = backup_writes;
     if (h == G.savedWrites) {
@@ -364,11 +361,18 @@ static void track_save(void) {
 }
 
 int pd_gpsp_save_dirty(void) {
-    return G.loaded && (G.savePending || backup_writes != G.savedWrites);
+    return G.loaded && (G.savePending || G.writeFailed || backup_writes != G.savedWrites);
 }
 
+// Written and on the card when it returns, a failed write tried once more.
 void pd_gpsp_flush_save(void) {
-    if (G.loaded && backup_writes != G.savedWrites) write_save();
+    if (!G.loaded) return;
+    G.retryWait = 0;
+    if (backup_writes != G.savedWrites) write_save();
+    pd_writer_drain();
+    note_failed_write();
+    G.retryWait = 0;
+    if (backup_writes != G.savedWrites && write_save()) pd_writer_drain();
 }
 
 // --- the machine ---
@@ -884,8 +888,9 @@ bool pd_gpsp_save_state(const char* path) {
     if (!buf) return false;
     uint32_t head[3] = { STATE_MAGIC, STATE_VERSION, G.crc };
     memcpy(buf, head, sizeof(head));
-    bool ok = retro_serialize(buf + 12, size) && write_file(path, buf, size + 12, NULL, 0);
-    free(buf);
+    bool ok = retro_serialize(buf + 12, size);
+    if (ok) pd_writer_write(path, buf, size + 12, NULL);
+    else free(buf);
     return ok;
 }
 
