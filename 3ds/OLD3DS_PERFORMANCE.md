@@ -47,7 +47,7 @@ in earlier local builds based on 1.6.0. Their 32 MiB Unbound r3 log showed:
 | Observation | Result |
 | --- | --- |
 | JIT | Enabled, 2048 KiB ROM / 384 KiB RAM cache |
-| Frontend presentation thread | Started on CPU 1 with the 80% CPU-time request accepted |
+| Frontend presentation thread | Accepted the 80% CPU-time request on CPU 1; once core 1 is lent to the renderer it runs on the game's own core |
 | gpSP render worker | Failed to start; no failure stage or kernel Result was recorded |
 | Emulated FPS | 32 to 52, often 47 to 50 in later samples |
 | Presented FPS | 12 to 18 |
@@ -96,6 +96,28 @@ It covers allocation refusal/retry, full-ROM CRC and block boundaries, repeated
 and out-of-range RAM/ROM writes, threaded/unthreaded pixel equivalence,
 injected thread-creation failure and close/reopen. Host builds use the
 interpreter; these tests do not execute ARM11 translated code or the 3DS GPU.
+
+## Stalls found by timing frames on an Old 3DS XL
+
+Frame timing on a real Old 3DS XL (Radical Red on gpSP) showed these stalls on
+the game's thread, and what each change did to them:
+
+| Stall | Before | After |
+| --- | --- | --- |
+| In-game save, game thread | 366 ms | 3 ms (written in the background) |
+| gpSP save check | 7.7 ms on 3 of 4 frames | 0 (gpSP counts its own writes) |
+| GPU texture flushes | ~4 ms a frame | 0.07 ms (the kernel's cache clean, not an IPC) |
+| Battery read | 10-33 ms every second | every 30 s |
+| Save state, game thread | not measured | 549 ms (the file itself is written in the background) |
+| State load | 4.1 s | ~0.4 s |
+| PARTY cards rebuilt | 80-89 ms | 35-43 ms |
+| Their scale-up | 62 ms | 17 ms |
+| Presented FPS on the field | ~33-37 | ~38-45 |
+
+Saves and states go to a low-priority writer thread on the game's core, which
+writes `.tmp`, sets the old file aside as `.bak` and renames the new one in. A
+read of a file still queued takes the queued bytes, and closing a game, sleep,
+HOME and exit wait for the queue. A failed save is tried again after 2 s.
 
 ## Hardware checks still needed before merging
 
