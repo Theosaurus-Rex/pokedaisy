@@ -38,7 +38,8 @@ static C3D_RenderTarget* upTarget;
 static C3D_Tex bottomTex, topTex, overlayTex, perfTex;
 
 // A New 3DS draws on its fourth core, an Old 3DS on the system's (core 1, lent at 80%: host_core1_take), so writing the
-// textures and waiting for the refresh come off the game's time.
+// textures and waiting for the refresh come off the game's time. With core 1 lent to the renderer (gpu_core1_lend) the
+// thread is on the game's own core.
 // gpu_draw hands a job over: what the frame needs is copied into the stage (the game runs on and rewrites its buffers),
 // and the thread takes it at the next refresh. One job at a time: a game that's ahead waits for the stage, which is
 // what paces it. Without that core gpu_draw runs the job itself.
@@ -69,6 +70,11 @@ static Thread wideThread;
 static LightEvent wideStart, wideDone;
 static void (*wideWork)(void);
 static volatile bool wideStop;
+// The kernel's own cache clean, as the audio path does: GSPGPU_FlushDataCache is an IPC to the GSP service.
+static void gpu_flush(const void* data, u32 size) {
+    svcStoreProcessDataCache(CUR_PROCESS_HANDLE, (u32) data, size);
+}
+
 static LightEvent jobReady, stageFree;
 static volatile unsigned jobsHanded, jobsDone;
 static volatile bool drawStop;
@@ -108,7 +114,7 @@ static bool tex_init(C3D_Tex* tex, int w, int h, GPU_TEXTURE_FILTER_PARAM filter
     C3D_TexSetFilter(tex, filter, filter);
     C3D_TexSetWrap(tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
     memset(tex->data, 0, tex->size);
-    GSPGPU_FlushDataCache(tex->data, tex->size);
+    gpu_flush(tex->data, tex->size);
     return true;
 }
 
@@ -133,7 +139,7 @@ bool gpu_init(void) {
     C3D_TexSetFilter(&overlayTex, GPU_NEAREST, GPU_NEAREST);
     C3D_TexSetWrap(&overlayTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
     memset(overlayTex.data, 0, overlayTex.size);
-    GSPGPU_FlushDataCache(overlayTex.data, overlayTex.size);
+    gpu_flush(overlayTex.data, overlayTex.size);
     for (int i = 0; i < 2; i++)
         if (!(tex_init(&gameTex[i], 256, 256, GPU_NEAREST) && tex_init(&wideTex[i], 512, 256, GPU_NEAREST))) return false;
     if (!C3D_TexInitVRAM(&upTex, 1024, 512, GPU_RGB565)) return false;
@@ -202,7 +208,7 @@ uint32_t* gpu_frame_done(void) {
 // A 0xRRGGBB canvas into an RGB565 texture.
 static void write_canvas(C3D_Tex* tex, const uint32_t* px, int w, int h) {
     pd_pixels_canvas(tex->data, tex->width, px, (unsigned) w, (unsigned) h);
-    GSPGPU_FlushDataCache(tex->data, tex->size);
+    gpu_flush(tex->data, tex->size);
 }
 
 // Canvases are written when they change; C3D_FrameBegin (SYNCDRAW) has waited
@@ -274,7 +280,7 @@ static void write_tiles(C3D_Tex* tex, const uint32_t* px, int w, int h, int stri
         }
     }
     u32 used = (u32) tileRows * tiles * 128;
-    GSPGPU_FlushDataCache(tex->data, used < tex->size ? used : tex->size);
+    gpu_flush(tex->data, used < tex->size ? used : tex->size);
 }
 
 static const uint32_t* widePx;
@@ -313,7 +319,7 @@ void gpu_set_perf(const uint32_t* px, int x, int y, int w) {
 
 static void write_perf(const uint32_t* px) {
     pd_pixels_overlay(perfTex.data, perfTex.width, px, 128, 16);
-    GSPGPU_FlushDataCache(perfTex.data, perfTex.size);
+    gpu_flush(perfTex.data, perfTex.size);
 }
 
 void gpu_show_overlay(bool shown, bool dim) {
@@ -324,7 +330,7 @@ void gpu_show_overlay(bool shown, bool dim) {
 // 0xAARRGGBB into the RGBA8 texture (the GPU reads its bytes A, B, G, R).
 static void write_overlay(const uint32_t* px) {
     pd_pixels_overlay(overlayTex.data, overlayTex.width, px, TOP_W, TOP_H);
-    GSPGPU_FlushDataCache(overlayTex.data, overlayTex.size);
+    gpu_flush(overlayTex.data, overlayTex.size);
 }
 
 static bool holdGame;
@@ -367,7 +373,7 @@ static void run_job(const struct draw_job* j, bool threaded) {
             pd_pixels_native(gameTex[texSide].data, gameTex[texSide].width, j->nativePx,
                              (unsigned) j->nativeStride, (unsigned) gameW, (unsigned) gameH);
             u32 used = (u32) ((gameH + 7) / 8) * (gameTex[texSide].width >> 3) * 128;
-            GSPGPU_FlushDataCache(gameTex[texSide].data, used);
+            gpu_flush(gameTex[texSide].data, used);
             nativeFrames++;
         } else {
             write_tiles(&gameTex[texSide], gamePx, gameW, gameH, GPU_GAME_STRIDE, &NO_HOLE, NULL);
