@@ -24,7 +24,7 @@ test-old3ds:
 	cmake --build $(BUILD)/old3ds-tests -j4
 	ctest --test-dir $(BUILD)/old3ds-tests --output-on-failure
 
-.PHONY: preview library-preview docs-shots test-scroll test-save 3ds-dev cia test-shiny test-roms test-gbguide test-gbdex test-dex test-font test-tr 3ds decomps fixture-roms azahar-test azahar-battle-test tables clean
+.PHONY: preview library-preview docs-shots test-scroll test-save 3ds-dev cia test-shiny test-roms test-gbguide test-gbdex test-dex test-font test-card-scale test-tr 3ds decomps fixture-roms azahar-test azahar-battle-test tables clean
 
 $(BUILD)/pd_font_test: core/pd_canvas.c core/pd_canvas.h core/pd_font.h core/pd_font_gen.c test/font_test.c
 	@mkdir -p $(BUILD)
@@ -36,6 +36,14 @@ test-font: $(BUILD)/pd_font_test
 # The menus' translations (pd_tr_gen.c) match the app's tables and tr_3ds.txt.
 test-tr:
 	python3 tools/gen_tr.py --check
+
+$(BUILD)/pd_card_scale_test: core/pd_card_scale.c core/pd_card_scale.h test/card_scale_test.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Icore -o $@ core/pd_card_scale.c test/card_scale_test.c
+
+# make test-card-scale: the party cards' enlargement, pixel for pixel against the divide-per-pixel version it replaced.
+test-card-scale: $(BUILD)/pd_card_scale_test
+	$(BUILD)/pd_card_scale_test
 
 $(BUILD)/pd_stats_test: $(CORE_SRC) $(wildcard core/*.h) test/stats_test.c desktop/pd_png.c
 	@mkdir -p $(BUILD)

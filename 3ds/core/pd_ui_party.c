@@ -14,6 +14,7 @@
 #include "pd_tables.h"
 #include "pd_experience.h"
 #include "pd_ui_internal.h"
+#include "pd_card_scale.h"
 
 static bool party_egg(const struct pd_ui* ui, const struct pd_mon* m) {
     return ui && ui->partySource && ui->partySource->egg ? ui->partySource->egg(ui->partySource->ctx, m) : m->egg || m->species == PD_SPECIES_EGG;
@@ -633,7 +634,6 @@ static void art_slot(struct pd_ui* ui, struct pd_canvas* c, const struct pd_game
 #define CARD_TEXT_DY (-4) // from where the game's capitals start to Pixel Operator's line
 
 struct window_at { short x, y; };
-struct card_scale { int num, den, extraW; };
 static const struct card_scale CARD_SCALES[] = { { 4, 3, 0 }, { 5, 4, 0 }, { 1, 1, 0 } };
 
 // The cards' windows at the size they're drawn at; false: the stretched grid.
@@ -671,48 +671,6 @@ static bool card_grid(const struct pd_party_style* st, const struct pd_canvas* c
     return true;
 }
 
-// a * wa + b * wb over wa + wb, each channel of 0xRRGGBB.
-static uint32_t mix(uint32_t a, uint32_t b, int wa, int wb) {
-    uint32_t out = 0;
-    for (int s = 0; s <= 16; s += 8) out |= (((a >> s & 0xFF) * (uint32_t) wa + (b >> s & 0xFF) * (uint32_t) wb) / (uint32_t) (wa + wb)) << s;
-    return out;
-}
-
-// Output pixel o of a num / den enlargement covers [o * den, o * den + den) in num-ths of a source pixel: one source pixel,
-// or the end of one and the start of the next.
-static int source_of(int o, const struct card_scale* k, int* near) {
-    int at = o * k->den, i = at / k->num, end = (i + 1) * k->num;
-    *near = end - at >= k->den ? k->den : end - at;
-    return i;
-}
-
-static void widen_row(const uint32_t* src, int srcW, uint32_t* dst, int w, const struct card_scale* k) {
-    for (int x = 0; x < w; x++) {
-        int near, i = source_of(x, k, &near);
-        dst[x] = near == k->den || i + 1 >= srcW ? src[i] : mix(src[i], src[i + 1], near, k->den - near);
-    }
-}
-
-static void screen_up(struct pd_canvas* c, const uint32_t* px, int srcW, int srcH, const struct card_scale* k) {
-    static uint32_t r[2][CARDS_CANVAS_W];
-    int have[2] = { -1, -1 };
-    for (int y = 0; y < c->h; y++) {
-        int near, s = source_of(y, k, &near);
-        if (s >= srcH) break;
-        for (int i = 0; i < 2; i++) {
-            int want = s + i < srcH ? s + i : s;
-            if (have[want & 1] != want) {
-                widen_row(px + want * srcW, srcW, r[want & 1], c->w, k);
-                have[want & 1] = want;
-            }
-        }
-        const uint32_t* a = r[s & 1];
-        const uint32_t* b = r[(s + 1 < srcH ? s + 1 : s) & 1];
-        uint32_t* d = c->px + y * c->w;
-        for (int x = 0; x < c->w; x++) d[x] = near == k->den ? a[x] : mix(a[x], b[x], near, k->den - near);
-    }
-}
-
 // A card's geometry: as art_geometry grows a slot, in width only.
 static struct art_geometry card_geometry(const struct pd_party_style* st, int extraW) {
     struct art_geometry a = { .st = st, .scale = 1, .left = extraW / 3, .mid = extraW - extraW / 3, .w = st->slotW + extraW, .h = st->slotH };
@@ -729,6 +687,7 @@ static uint32_t hash_bytes(uint32_t h, const void* p, size_t n) {
 // What the scaled cards are drawn from: the party, the cursor, the layout, the look and the art. The same key = the same
 // pixels, so a redraw for something else (a tab press, the clock) copies them instead of scaling the screen again - on a
 // 3DS the scale took most of a frame.
+
 static uint32_t cards_key(const struct pd_canvas* c, const struct pd_game* g, const struct pd_party_art* art, const struct window_at* at,
                           const struct card_scale* k, const struct pd_snapshot* s, int selected) {
     uint32_t h = 2166136261u;
@@ -739,8 +698,17 @@ static uint32_t cards_key(const struct pd_canvas* c, const struct pd_game* g, co
     h = hash_bytes(h, k, sizeof(*k));
     h = hash_bytes(h, at, sizeof(*at) * PD_PARTY_SIZE);
     h = hash_bytes(h, pd_backdrop_colors, sizeof(pd_backdrop_colors));
+    // Only what a card shows: experience, friendship, PP and the rest of the struct change on the field every few
+    // seconds, and each change rebuilt the whole scaled screen (80 ms on an Old 3DS).
     int n = s->partyCount < PD_PARTY_SIZE ? s->partyCount : PD_PARTY_SIZE;
-    return hash_bytes(h, s->party, sizeof(s->party[0]) * (size_t) (n > 0 ? n : 0));
+    for (int i = 0; i < n; i++) {
+        const struct pd_mon* m = &s->party[i];
+        const int shown[] = { m->species, m->egg, m->gender, m->level, m->hp, m->maxHp, (int) m->status, m->heldItem, m->shiny };
+        h = hash_bytes(h, shown, sizeof(shown));
+        const char* end = memchr(m->nickname, 0, sizeof(m->nickname));
+        h = hash_bytes(h, m->nickname, end ? (size_t) (end - m->nickname) : sizeof(m->nickname));
+    }
+    return h;
 }
 
 // The cards on the canvas, over its backdrop, or only the backdrop if `cards` is false. selected: which card, -1 none.
@@ -771,7 +739,7 @@ static bool draw_cards(struct pd_canvas* c, const struct pd_game* g, const struc
         art_slot_at(up ? &screen : c, g, art, &a, at[i].x, at[i].y, m, m && i == selected);
     }
     cardTextsOn = false;
-    if (up) screen_up(c, px, w, h, k);
+    if (up) pd_card_screen_up(c->px, c->w, c->h, px, w, h, k);
     // Its words in the companion's font (TEXT SIZE SMALL's capitals start a row lower in the cell than Pixel Operator's).
     const int capShift = pd_font_text_small() ? 1 : 0;
     for (int i = 0; i < cardTextCount; i++) {
